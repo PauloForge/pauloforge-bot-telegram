@@ -30,6 +30,14 @@ def sb_update(table, rid, payload):
 def first(rows):
     return rows[0] if isinstance(rows, list) and rows else None
 
+def ins_or_raise(table, payload, passo):
+    r = sb_insert(table, payload)
+    row = first(r)
+    if not row:
+        msg = r.get('message') if isinstance(r, dict) else 'resposta vazia'
+        raise Exception(f"{passo}: {msg}")
+    return row
+
 def bot_row(bid):
     return first(sb_select('bots', id=bid))
 
@@ -102,18 +110,20 @@ async def finalizar(update, ctx, uid):
     w = wizard.pop(uid); d = w['dados']
     wait = await update.message.reply_text("⏳ Aguarde, seu acesso está sendo gerado...")
     try:
-        c = first(sb_select('creators', email=d['email']))
+        email = d['email'].lower().strip()
+        c = first(sb_select('creators', email=email))
         if c:
-            cid = c['id']; sb_update('creators', cid, {'telegram_id': uid, 'nome': d['nome']})
+            cid = c['id']
+            sb_update('creators', cid, {'telegram_id': uid, 'nome': d['nome']})
         else:
-            cid = first(sb_insert('creators', {'email': d['email'], 'telegram_id': uid, 'nome': d['nome']}) )['id']
+            cid = ins_or_raise('creators', {'email': email, 'telegram_id': uid, 'nome': d['nome']}, 'criar conta')['id']
         brow = first(sb_select('bots', bot_token=d['token']))
         if brow:
             sb_update('bots', brow['id'], {'creator_id': cid, 'nome_exibicao': d['nome'], 'chave_pix': d['pix'], 'ativo': True})
         else:
-            brow = first(sb_insert('bots', {'bot_token': d['token'], 'bot_username': d['username'], 'nome_exibicao': d['nome'], 'chave_pix': d['pix'], 'creator_id': cid}))
-        tok = secrets.token_urlsafe(12)
-        sb_insert('access_tokens', {'creator_id': cid, 'token': tok})
+            brow = ins_or_raise('bots', {'bot_token': d['token'], 'bot_username': d['username'], 'nome_exibicao': d['nome'], 'chave_pix': d['pix'], 'creator_id': cid}, 'cadastrar bot')
+        sb_insert('access_tokens', {'creator_id': cid, 'token': secrets.token_urlsafe(12)})
+        tok_painel = first(sb_select('access_tokens', creator_id=cid))
         if brow:
             try: await start_bot_app(brow)
             except Exception as e: logger.error(e)
@@ -123,7 +133,7 @@ async def finalizar(update, ctx, uid):
         try: await wait.delete()
         except Exception: pass
         await ctx.bot.send_message(uid,
-            f"🎉 PRONTO, {d['nome']}!\n\n🤖 Seu bot: @{d['username']} (id {brow['id'] if brow else '?'})\n🔑 Token do painel: {tok}\n📧 Email: {d['email']}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n\n📖 Mande fotos/vídeos DIRETO no seu bot pra publicar pros assinantes!\n/stats no seu bot mostra seus números.")
+            f"🎉 PRONTO, {d['nome']}!\n\n🤖 Seu bot: @{d['username']} (id {brow['id']})\n🔑 Token do painel: {tok_painel['token'] if tok_painel else '-'}\n📧 Email: {email}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n\n📖 Mande fotos/vídeos DIRETO no seu bot pra publicar pros assinantes!\n/stats no seu bot mostra seus números.")
     except Exception as e:
         logger.exception(e)
         try: await update.message.reply_text(f"❌ Erro ao gerar acesso: {e}")
@@ -159,9 +169,8 @@ async def iniciar_ativar(update, ctx, uid):
     bots = sb_select('bots', ativo=True)
     if not bots:
         return await update.message.reply_text("❌ Nenhum bot cadastrado ainda.")
-    ativ[uid] = {'step': 'user'}
+    ativ[uid] = {'step': 'user', 'bots': {str(b['id']): b['id'] for b in bots}}
     lista = "\n".join(f"#{b['id']} — {b['nome_exibicao']}" for b in bots)
-    ativ[uid]['bots'] = {str(b['id']): b['id'] for b in bots}
     await update.message.reply_text(f"🎯 *ATIVAR ASSINANTE*\n\nBots:\n{lista}\n\nDigite o NÚMERO do bot:", parse_mode='Markdown')
 
 async def ativ_text(update, ctx, uid):
@@ -171,7 +180,7 @@ async def ativ_text(update, ctx, uid):
         if not bid:
             return await update.message.reply_text("❌ Número de bot inválido.")
         a['bid'] = bid; a['step'] = 'dias'
-        await update.message.reply_text("Agora o ID do cliente (o número do Telegram dele):")
+        await update.message.reply_text("Agora o ID do cliente (número do Telegram dele):")
     elif a['step'] == 'dias':
         if not txt.isdigit():
             return await update.message.reply_text("❌ Só números.")
@@ -211,9 +220,9 @@ async def hub_ativar(update, ctx):
 
 async def hub_gerartoken(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    email = update.message.text.split(maxsplit=1)[1].strip()
+    email = update.message.text.split(maxsplit=1)[1].strip().lower()
     c = first(sb_select('creators', email=email))
-    cid = c['id'] if c else first(sb_insert('creators', {'email': email}))['id']
+    cid = c['id'] if c else ins_or_raise('creators', {'email': email}, 'criar conta')['id']
     tok = secrets.token_urlsafe(16)
     sb_insert('access_tokens', {'creator_id': cid, 'token': tok})
     await update.message.reply_text(f"🔑 Token do painel pra {email}:\n{tok}")
@@ -270,7 +279,7 @@ def main():
     app.add_handler(CommandHandler('bots', hub_bots))
     app.add_handler(CallbackQueryHandler(hub_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    logger.info("🛠️ HUB PauloForge v3.1 online!")
+    logger.info("🛠️ HUB PauloForge v3.2 online!")
     app.run_polling()
 
 if __name__ == '__main__':
