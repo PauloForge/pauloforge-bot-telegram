@@ -1,4 +1,8 @@
-import os, logging, secrets, requests
+import os
+import logging
+import secrets
+import asyncio
+import requests
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -13,7 +17,12 @@ logger = logging.getLogger(__name__)
 H = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
 
 def sb_select(table, **f):
-    return requests.get(f"{SB_URL}/rest/v1/{table}", headers=H, params={c: f"eq.{v}" for c, v in f.items()}).json()
+    params = {}
+    for c, v in f.items():
+        if v is True: v = 'true'
+        elif v is False: v = 'false'
+        params[c] = f"eq.{v}"
+    return requests.get(f"{SB_URL}/rest/v1/{table}", headers=H, params=params).json()
 
 def sb_insert(table, payload):
     return requests.post(f"{SB_URL}/rest/v1/{table}", headers={**H, "Prefer": "return=representation"}, json=payload).json()
@@ -46,17 +55,22 @@ def make_start(bid):
 
 def make_cb(bid):
     async def h(update, ctx):
-        q = update.callback_query; await q.answer(); uid = update.effective_user.id
+        q = update.callback_query
+        await q.answer()
+        uid = update.effective_user.id
         if not is_active_sub(bid, uid):
             return await q.message.reply_text("⚠️ Assinatura inativa.")
         medias = sb_select('medias', bot_id=bid)
-        if not medias: return await q.message.reply_text("📸 Conteúdo em breve!")
+        if not medias:
+            return await q.message.reply_text("📸 Conteúdo em breve!")
         for m in medias:
-            if m['file_type'] == 'photo': await ctx.bot.send_photo(uid, m['file_id'], caption=m['legenda'])
-            else: await ctx.bot.send_video(uid, m['file_id'], caption=m['legenda'])
+            if m['file_type'] == 'photo':
+                await ctx.bot.send_photo(uid, m['file_id'], caption=m['legenda'])
+            else:
+                await ctx.bot.send_video(uid, m['file_id'], caption=m['legenda'])
     return h
 
-# ---------- CRIADORA publicando ----------
+# ---------- CRIADORA PUBLICANDO ----------
 def make_media(bid):
     async def h(update, ctx):
         b = bot_row(bid); uid = update.effective_user.id
@@ -70,9 +84,12 @@ def make_media(bid):
         subs = sb_select('subscribers', bot_id=bid, status='active')
         for s in subs:
             try:
-                if ftype == 'photo': await ctx.bot.send_photo(s['telegram_id'], fid, caption=msg.caption)
-                else: await ctx.bot.send_video(s['telegram_id'], fid, caption=msg.caption)
-            except Exception as e: logger.warning(e)
+                if ftype == 'photo':
+                    await ctx.bot.send_photo(s['telegram_id'], fid, caption=msg.caption)
+                else:
+                    await ctx.bot.send_video(s['telegram_id'], fid, caption=msg.caption)
+            except Exception as e:
+                logger.warning(e)
         await msg.reply_text(f"✅ Publicado para {len(subs)} assinante(s)!")
     return h
 
@@ -96,18 +113,22 @@ async def hub_novabot(update, ctx):
     except Exception:
         return await update.message.reply_text("Formato: /novabot TOKEN | Nome | Pix")
     rows = sb_insert('bots', {'bot_token': token, 'nome_exibicao': nome, 'chave_pix': pix})
-    if not rows: return await update.message.reply_text("❌ Falha ao cadastrar.")
+    if not rows:
+        return await update.message.reply_text("❌ Falha ao cadastrar.")
     await start_bot_app(rows[0])
     await update.message.reply_text(f"✅ Bot *{nome}* (id {rows[0]['id']}) NO AR!", parse_mode='Markdown')
 
 async def hub_ativar(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     p = update.message.text.split()
-    bid, uid = int(p[1]), int(p[2]); dias = int(p[3]) if len(p) > 3 else 30
+    bid, uid = int(p[1]), int(p[2])
+    dias = int(p[3]) if len(p) > 3 else 30
     exp = (datetime.now() + timedelta(days=dias)).isoformat()
     ex = sb_select('subscribers', bot_id=bid, telegram_id=uid)
-    if ex: sb_update('subscribers', ex[0]['id'], {'status': 'active', 'data_expiracao': exp})
-    else: sb_insert('subscribers', {'bot_id': bid, 'telegram_id': uid, 'status': 'active', 'data_expiracao': exp})
+    if ex:
+        sb_update('subscribers', ex[0]['id'], {'status': 'active', 'data_expiracao': exp})
+    else:
+        sb_insert('subscribers', {'bot_id': bid, 'telegram_id': uid, 'status': 'active', 'data_expiracao': exp})
     await update.message.reply_text(f"✅ Assinante {uid} ativado no bot {bid} ({dias} dias).")
 
 async def hub_gerartoken(update, ctx):
@@ -130,8 +151,22 @@ async def hub_bots(update, ctx):
     bots = sb_select('bots')
     await update.message.reply_text("\n".join(f"#{b['id']} {b['nome_exibicao']}" for b in bots) or "Sem bots.")
 
+# ---------- ENVIA CÓDIGO DO PAINEL NO TELEGRAM ----------
+async def envia_codigos(app):
+    while True:
+        try:
+            for lc in sb_select('login_codes', enviado=False):
+                cs = sb_select('creators', id=lc['creator_id'])
+                if cs and cs[0].get('telegram_id'):
+                    await app.bot.send_message(cs[0]['telegram_id'], f"🔐 Código de acesso ao painel: {lc['code']}")
+                    sb_update('login_codes', lc['id'], {'enviado': True})
+        except Exception as e:
+            logger.warning(e)
+        await asyncio.sleep(5)
+
 # ---------- MOTOR MULTI-BOT ----------
 running = {}
+
 async def start_bot_app(b):
     app = Application.builder().token(b['bot_token']).build()
     bid = b['id']
@@ -144,9 +179,12 @@ async def start_bot_app(b):
     logger.info(f"🤖 Bot #{bid} {b['nome_exibicao']} online")
 
 async def post_init(application):
+    asyncio.create_task(envia_codigos(application))
     for b in sb_select('bots', ativo=True):
-        try: await start_bot_app(b)
-        except Exception as e: logger.error(f"erro bot {b['id']}: {e}")
+        try:
+            await start_bot_app(b)
+        except Exception as e:
+            logger.error(f"erro bot {b['id']}: {e}")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
