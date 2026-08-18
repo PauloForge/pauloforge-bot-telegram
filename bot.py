@@ -1,4 +1,4 @@
-import os, re, logging, secrets, asyncio, requests
+import os, re, logging, secrets, asyncio, time, requests
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -349,18 +349,23 @@ async def on_text(update, ctx):
     if uid in ativ and uid == ADMIN_ID: return await ativ_text(update, ctx, uid)
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler('start', hub_start))
-    app.add_handler(CommandHandler('criarbot', hub_criarbot))
-    app.add_handler(CommandHandler('novabot', hub_criarbot))
-    app.add_handler(CommandHandler('ativar', hub_ativar))
-    app.add_handler(CommandHandler('renovar', hub_renovar))
-    app.add_handler(CommandHandler('gerartoken', hub_gerartoken))
-    app.add_handler(CommandHandler('bots', hub_bots))
-    app.add_handler(CallbackQueryHandler(hub_cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    logger.info("🛠️ HUB PauloForge v5.1 online!")
-    app.run_polling()
+    while True:
+        try:
+            app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+            app.add_handler(CommandHandler('start', hub_start))
+            app.add_handler(CommandHandler('criarbot', hub_criarbot))
+            app.add_handler(CommandHandler('novabot', hub_criarbot))
+            app.add_handler(CommandHandler('ativar', hub_ativar))
+            app.add_handler(CommandHandler('renovar', hub_renovar))
+            app.add_handler(CommandHandler('gerartoken', hub_gerartoken))
+            app.add_handler(CommandHandler('bots', hub_bots))
+            app.add_handler(CallbackQueryHandler(hub_cb))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+            logger.info("🛠️ HUB PauloForge v5.2 online!")
+            app.run_polling()
+        except Exception as e:
+            logger.error(f"💥 Hub caiu ({e}) — reiniciando em 5s...")
+            time.sleep(5)
 
 if __name__ == '__main__':
     main()
