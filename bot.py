@@ -55,22 +55,20 @@ def make_start(bid):
             return
         if not first(sb_select('leads', bot_id=bid, telegram_id=uid)):
             sb_insert('leads', {'bot_id': bid, 'telegram_id': uid})
+        legenda = f"🔞 *{b['nome_exibicao']}*\n\nAssinatura: R$ {b['preco']}/mês\n*Pix:* `{b['chave_pix']}`\n\nAssine e receba TUDO na hora 😈"
         if b.get('welcome_video'):
-            try: await ctx.bot.send_video(uid, b['welcome_video'],
-                caption=f"🔞 *{b['nome_exibicao']}*\nAssine e receba TUDO na hora 😈",
-                parse_mode='Markdown', reply_markup=btn_assinar(b))
+            try:
+                await ctx.bot.send_video(uid, b['welcome_video'], caption=legenda, parse_mode='Markdown', reply_markup=btn_assinar(b))
+                return
             except Exception as e: logger.warning(e)
-        await update.message.reply_text(
-            f"🔞 *{b['nome_exibicao']}*\n\nAssinatura: R$ {b['preco']}/mês\n\n*Pix:* `{b['chave_pix']}`\n\nToque no botão pra assinar agora 👇",
-            parse_mode='Markdown', reply_markup=btn_assinar(b))
+        await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=btn_assinar(b))
     return h
 
 def make_cb(bid):
     async def h(update, ctx):
         q = update.callback_query; await q.answer(); uid = update.effective_user.id
         if not is_active_sub(bid, uid):
-            b = bot_row(bid)
-            return await q.message.reply_text("⚠️ Só assinantes. Toque abaixo 👇", reply_markup=btn_assinar(b))
+            return await q.message.reply_text("⚠️ Só assinantes. Toque abaixo 👇", reply_markup=btn_assinar(bot_row(bid)))
         medias = sb_select('medias', bot_id=bid, tipo='vip')
         if not medias:
             return await q.message.reply_text("📸 Conteúdo em breve!")
@@ -114,7 +112,7 @@ def make_vincular(bid):
         if not cs:
             return await update.message.reply_text("❌ Código inválido.")
         sb_update('creators', cs['id'], {'telegram_id': update.effective_user.id})
-        await update.message.reply_text("🔗 Telegram vinculado ao painel! Agora você gerencia tudo pelo site.")
+        await update.message.reply_text("🔗 Telegram vinculado ao painel!")
     return h
 
 # ---------- WIZARD CRIAR BOT ----------
@@ -134,7 +132,7 @@ async def finalizar(update, ctx, uid):
         if c:
             cid = c['id']; sb_update('creators', cid, {'telegram_id': uid, 'nome': d['nome']})
         else:
-            cid = first(sb_insert('creators', {'email': email, 'telegram_id': uid, 'nome': d['nome'], 'link_code': str(secrets.randbelow(9000) + 1000), 'ref_code': ''}))['id']
+            cid = first(sb_insert('creators', {'email': email, 'telegram_id': uid, 'nome': d['nome'], 'link_code': str(secrets.randbelow(9000) + 1000)}))['id']
             c2 = first(sb_select('creators', id=cid))
             if c2 and not c2.get('ref_code'): sb_update('creators', cid, {'ref_code': 'PF' + str(cid)})
         brow = first(sb_select('bots', bot_token=d['token']))
@@ -144,16 +142,13 @@ async def finalizar(update, ctx, uid):
             brow = first(sb_insert('bots', {'bot_token': d['token'], 'bot_username': d['username'], 'nome_exibicao': d['nome'], 'chave_pix': d['pix'], 'creator_id': cid, 'expira_em': (datetime.now() + timedelta(days=1)).isoformat()}))
         tok = secrets.token_urlsafe(12)
         sb_insert('access_tokens', {'creator_id': cid, 'token': tok})
-        if brow:
-            try: await start_bot_app(brow)
-            except Exception as e: logger.error(e)
         for mid in w['msgs']:
             try: await ctx.bot.delete_message(uid, mid)
             except Exception: pass
         try: await wait.delete()
         except Exception: pass
         await ctx.bot.send_message(uid,
-            f"🎉 PRONTO, {d['nome']}!\n\n🤖 Seu bot: @{d['username']} (id {brow['id']})\n🔑 Token do painel: {tok}\n📧 Email: {email}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n🎁 Teste grátis: 1 dia. Depois renove com o suporte.\n\n📖 Mande fotos/vídeos no seu bot pra publicar!\n/stats mostra seus números.")
+            f"🎉 PRONTO, {d['nome']}!\n\n🤖 Seu bot: @{d['username']} (id {brow['id']})\n🔑 Token do painel: {tok}\n📧 Email: {email}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n🎁 Teste grátis: 1 dia.\n\n📖 O worker liga seu bot em até 20s. Mande fotos/vídeos nele pra publicar!")
     except Exception as e:
         logger.exception(e)
         try: await update.message.reply_text(f"❌ Erro ao gerar acesso: {e}")
@@ -177,7 +172,7 @@ async def wizard_text(update, ctx, uid):
         await update.message.reply_text("*Passo 3/4* — Nome de exibição:", parse_mode='Markdown')
     elif w['step'] == 'nome':
         w['dados']['nome'] = txt; w['step'] = 'pix'
-        await update.message.reply_text("*Passo 4/4* — Sua chave Pix pra receber:", parse_mode='Markdown')
+        await update.message.reply_text("*Passo 4/4* — Sua chave Pix:", parse_mode='Markdown')
     elif w['step'] == 'pix':
         w['dados']['pix'] = txt
         await finalizar(update, ctx, uid)
@@ -190,8 +185,7 @@ async def iniciar_ativar(update, ctx, uid):
     if not bots:
         return await update.message.reply_text("❌ Nenhum bot cadastrado.")
     ativ[uid] = {'step': 'user', 'bots': {str(b['id']): b['id'] for b in bots}}
-    lista = "\n".join(f"#{b['id']} — {b['nome_exibicao']}" for b in bots)
-    await update.message.reply_text(f"🎯 *ATIVAR ASSINANTE*\n\nBots:\n{lista}\n\nDigite o NÚMERO do bot:", parse_mode='Markdown')
+    await update.message.reply_text("🎯 *ATIVAR ASSINANTE*\n\n" + "\n".join(f"#{b['id']} — {b['nome_exibicao']}" for b in bots) + "\n\nDigite o NÚMERO do bot:", parse_mode='Markdown')
 
 async def ativ_text(update, ctx, uid):
     a = ativ[uid]; txt = update.message.text.strip()
@@ -199,7 +193,7 @@ async def ativ_text(update, ctx, uid):
         bid = a['bots'].get(txt.replace('#', ''))
         if not bid: return await update.message.reply_text("❌ Bot inválido.")
         a['bid'] = bid; a['step'] = 'dias'
-        await update.message.reply_text("ID do cliente (número do Telegram):")
+        await update.message.reply_text("ID do cliente:")
     elif a['step'] == 'dias':
         if not txt.isdigit(): return await update.message.reply_text("❌ Só números.")
         a['uidc'] = int(txt); a['step'] = 'confirma'
@@ -216,20 +210,17 @@ async def ativ_text(update, ctx, uid):
 async def hub_renovar(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     p = update.message.text.split()
-    bid, dias = int(p[1]), int(p[2]) if len(p) > 2 else 30
+    bid = int(p[1]); dias = int(p[2]) if len(p) > 2 else 30
     b = bot_row(bid)
     if not b: return await update.message.reply_text("❌ Bot não encontrado.")
     sb_update('bots', bid, {'ativo': True, 'expira_em': (datetime.now() + timedelta(days=dias)).isoformat()})
-    if bid not in running:
-        try: await start_bot_app(b)
-        except Exception as e: logger.error(e)
+    msg = f"✅ Bot #{bid} renovado +{dias}d."
     if b.get('creator_id'):
         cr = first(sb_select('creators', id=b['creator_id']))
         if cr and cr.get('indicado_por'):
             sb_insert('credits', {'creator_id': cr['indicado_por'], 'valor': 6.0, 'motivo': f'indicação bot #{bid}'})
-            await update.message.reply_text(f"✅ Bot #{bid} renovado +{dias}d. 💰 20% creditado pra afiliada.")
-            return
-    await update.message.reply_text(f"✅ Bot #{bid} renovado por {dias} dias.")
+            msg += " 💰 20% creditado pra afiliada."
+    await update.message.reply_text(msg)
 
 # ---------- HUB ----------
 async def hub_start(update, ctx):
@@ -263,19 +254,17 @@ async def hub_gerartoken(update, ctx):
 async def hub_bots(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     bots = sb_select('bots')
-    await update.message.reply_text("\n".join(f"#{b['id']} {b['nome_exibicao']} @{b.get('bot_username') or '-'} ativo={b.get('ativo')}" for b in bots) or "Sem bots.")
+    await update.message.reply_text("\n".join(f"#{b['id']} {b['nome_exibicao']} ativo={b.get('ativo')}" for b in bots) or "Sem bots.")
 
-# ---------- TAREFAS: códigos, drip 6h, expiração ----------
+# ---------- TAREFAS ----------
 async def envia_codigos(app):
     while True:
         try:
             for lc in sb_select('login_codes', enviado=False):
                 cs = first(sb_select('creators', id=lc['creator_id']))
                 if cs and cs.get('telegram_id'):
-                    if lc.get('tipo') == 'retirada':
-                        await app.bot.send_message(cs['telegram_id'], f"💸 Código de retirada: {lc['code']}")
-                    else:
-                        await app.bot.send_message(cs['telegram_id'], f"🔐 Código de acesso ao painel: {lc['code']}")
+                    prefix = "💸 Código de retirada:" if lc.get('tipo') == 'retirada' else "🔐 Código de acesso ao painel:"
+                    await app.bot.send_message(cs['telegram_id'], f"{prefix} {lc['code']}")
                     sb_update('login_codes', lc['id'], {'enviado': True})
         except Exception as e: logger.warning(e)
         await asyncio.sleep(5)
@@ -284,8 +273,7 @@ async def drip_teasers(app):
     while True:
         try:
             limite = (datetime.now() - timedelta(hours=6)).isoformat()
-            leads = sb_select('leads')
-            for ld in leads:
+            for ld in sb_select('leads'):
                 if ld.get('ultimo_aviso') and ld['ultimo_aviso'] > limite: continue
                 if is_active_sub(ld['bot_id'], ld['telegram_id']): continue
                 b = bot_row(ld['bot_id'])
@@ -294,10 +282,9 @@ async def drip_teasers(app):
                 if not teasers: continue
                 t = teasers[secrets.randbelow(len(teasers))]
                 try:
-                    kb = btn_assinar(b)
                     cap = (t['legenda'] or 'Olha o que você tá perdendo 👀') + "\n\nVem assinar e receber TUDO 😈"
-                    if t['file_type'] == 'photo': await app.bot.send_photo(ld['telegram_id'], t['file_id'], caption=cap, reply_markup=kb)
-                    else: await app.bot.send_video(ld['telegram_id'], t['file_id'], caption=cap, reply_markup=kb)
+                    if t['file_type'] == 'photo': await app.bot.send_photo(ld['telegram_id'], t['file_id'], caption=cap, reply_markup=btn_assinar(b))
+                    else: await app.bot.send_video(ld['telegram_id'], t['file_id'], caption=cap, reply_markup=btn_assinar(b))
                 except Exception as e: logger.warning(e)
                 sb_update('leads', ld['id'], {'ultimo_aviso': datetime.now().isoformat()})
         except Exception as e: logger.warning(e)
@@ -312,11 +299,21 @@ async def checa_expiracao(app):
                     sb_update('bots', b['id'], {'ativo': False})
                     cs = first(sb_select('creators', id=b['creator_id'])) if b.get('creator_id') else None
                     if cs and cs.get('telegram_id'):
-                        await app.bot.send_message(cs['telegram_id'], "⛔ Seu bot ficou offline (plano vencido). Renove com o suporte pra voltar ao ar.")
+                        await app.bot.send_message(cs['telegram_id'], "⛔ Bot offline (plano vencido). Renove com o suporte.")
         except Exception as e: logger.warning(e)
         await asyncio.sleep(60)
 
-# ---------- MOTOR MULTI-BOT ----------
+async def vigia_bots(app):
+    while True:
+        try:
+            for b in sb_select('bots', ativo=True):
+                if b['id'] not in running:
+                    try: await start_bot_app(b)
+                    except Exception as e: logger.error(f"vigia bot {b['id']}: {e}")
+        except Exception as e: logger.warning(e)
+        await asyncio.sleep(20)
+
+# ---------- MOTOR ----------
 running = {}
 
 async def start_bot_app(b):
@@ -344,9 +341,7 @@ async def post_init(application):
     asyncio.create_task(envia_codigos(application))
     asyncio.create_task(drip_teasers(application))
     asyncio.create_task(checa_expiracao(application))
-    for b in sb_select('bots', ativo=True):
-        try: await start_bot_app(b)
-        except Exception as e: logger.error(f"erro bot {b['id']}: {e}")
+    asyncio.create_task(vigia_bots(application))
 
 async def on_text(update, ctx):
     uid = update.effective_user.id
@@ -364,7 +359,7 @@ def main():
     app.add_handler(CommandHandler('bots', hub_bots))
     app.add_handler(CallbackQueryHandler(hub_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    logger.info("🛠️ HUB PauloForge v5 online!")
+    logger.info("🛠️ HUB PauloForge v5.1 online!")
     app.run_polling()
 
 if __name__ == '__main__':
