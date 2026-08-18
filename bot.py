@@ -45,16 +45,6 @@ def btn_assinar(b):
         f"💳 Assinar por R$ {b['preco']}/mês",
         url=f"{WA}?text=Quero%20assinar%20{b['nome_exibicao']}")]])
 
-async def manda_teaser(ctx, bid, uid, b):
-    teasers = sb_select('medias', bot_id=bid, tipo='teaser')
-    if not teasers: return
-    t = teasers[0]
-    cap = (t['legenda'] or 'Olha o que você tá perdendo 👀') + "\n\nVem aproveitar! Assina e recebe TUDO 😈"
-    try:
-        if t['file_type'] == 'photo': await ctx.bot.send_photo(uid, t['file_id'], caption=cap, reply_markup=btn_assinar(b))
-        else: await ctx.bot.send_video(uid, t['file_id'], caption=cap, reply_markup=btn_assinar(b))
-    except Exception as e: logger.warning(e)
-
 # ---------- BOTS DAS CRIADORAS ----------
 def make_start(bid):
     async def h(update, ctx):
@@ -69,11 +59,9 @@ def make_start(bid):
         if b.get('welcome_video'):
             try:
                 await ctx.bot.send_video(uid, b['welcome_video'], caption=legenda, parse_mode='Markdown', reply_markup=btn_assinar(b))
-            except Exception:
-                await update.message.reply_text(legenda, parse_mode='Markdown', reply_markup=btn_assinar(b))
-        else:
-            await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=btn_assinar(b))
-        await manda_teaser(ctx, bid, uid, b)
+                return
+            except Exception as e: logger.warning(e)
+        await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=btn_assinar(b))
     return h
 
 def make_cb(bid):
@@ -238,8 +226,8 @@ async def hub_renovar(update, ctx):
 async def hub_start(update, ctx):
     uid = update.effective_user.id
     if uid == ADMIN_ID:
-        return await update.message.reply_text("🛠️ *HUB ADMIN*\n\n/criarbot — wizard novo bot\n/ativar — wizard assinante\n/renovar bot_id [dias]\n/gerartoken email\n/bots", parse_mode='Markdown')
-    await update.message.reply_text("⚒️ *PauloForge Soluções*\nTenha seu próprio bot no Telegram.", parse_mode='Markdown',
+        return await update.message.reply_text("🛠️ HUB ADMIN\n\n/criarbot — wizard novo bot\n/ativar — wizard assinante\n/renovar bot_id dias\n/gerartoken email\n/bots")
+    await update.message.reply_text("⚒️ PauloForge Soluções\nTenha seu próprio bot no Telegram.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Criar meu bot", callback_data='criarbot')]]))
 
 async def hub_cb(update, ctx):
@@ -267,6 +255,9 @@ async def hub_bots(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     bots = sb_select('bots')
     await update.message.reply_text("\n".join(f"#{b['id']} {b['nome_exibicao']} ativo={b.get('ativo')}" for b in bots) or "Sem bots.")
+
+async def error_handler(update, ctx):
+    logger.error(f"💥 ERRO DE HANDLER: {ctx.error} | update: {str(update)[:200]}")
 
 # ---------- TAREFAS ----------
 async def envia_codigos(app):
@@ -337,6 +328,7 @@ async def start_bot_app(b):
     app.add_handler(CommandHandler('vincular', make_vincular(bid)))
     app.add_handler(CallbackQueryHandler(make_cb(bid)))
     app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO), make_media(bid)))
+    app.add_error_handler(error_handler)
     await app.initialize(); await app.start(); await app.updater.start_polling()
     running[bid] = app
     logger.info(f"🤖 Bot #{bid} {b['nome_exibicao']} online")
@@ -350,6 +342,11 @@ async def stop_bot_app(bid):
         logger.info(f"🛑 Bot #{bid} offline")
 
 async def post_init(application):
+    try:
+        me = await application.bot.get_me()
+        logger.info(f"🩺 DIAG: hub conectado como @{me.username}")
+    except Exception as e:
+        logger.error(f"🩺 DIAG: get_me falhou: {e}")
     asyncio.create_task(envia_codigos(application))
     asyncio.create_task(drip_teasers(application))
     asyncio.create_task(checa_expiracao(application))
@@ -373,7 +370,8 @@ def main():
             app.add_handler(CommandHandler('bots', hub_bots))
             app.add_handler(CallbackQueryHandler(hub_cb))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-            logger.info("🛠️ HUB PauloForge v5.3 online!")
+            app.add_error_handler(error_handler)
+            logger.info("🛠️ HUB PauloForge v5.4 online!")
             app.run_polling()
         except Exception as e:
             logger.error(f"💥 Hub caiu ({e}) — reiniciando em 5s...")
