@@ -45,6 +45,16 @@ def btn_assinar(b):
         f"💳 Assinar por R$ {b['preco']}/mês",
         url=f"{WA}?text=Quero%20assinar%20{b['nome_exibicao']}")]])
 
+async def manda_teaser(ctx, bid, uid, b):
+    teasers = sb_select('medias', bot_id=bid, tipo='teaser')
+    if not teasers: return
+    t = teasers[0]
+    cap = (t['legenda'] or 'Olha o que você tá perdendo 👀') + "\n\nVem aproveitar! Assina e recebe TUDO 😈"
+    try:
+        if t['file_type'] == 'photo': await ctx.bot.send_photo(uid, t['file_id'], caption=cap, reply_markup=btn_assinar(b))
+        else: await ctx.bot.send_video(uid, t['file_id'], caption=cap, reply_markup=btn_assinar(b))
+    except Exception as e: logger.warning(e)
+
 # ---------- BOTS DAS CRIADORAS ----------
 def make_start(bid):
     async def h(update, ctx):
@@ -59,9 +69,11 @@ def make_start(bid):
         if b.get('welcome_video'):
             try:
                 await ctx.bot.send_video(uid, b['welcome_video'], caption=legenda, parse_mode='Markdown', reply_markup=btn_assinar(b))
-                return
-            except Exception as e: logger.warning(e)
-        await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=btn_assinar(b))
+            except Exception:
+                await update.message.reply_text(legenda, parse_mode='Markdown', reply_markup=btn_assinar(b))
+        else:
+            await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=btn_assinar(b))
+        await manda_teaser(ctx, bid, uid, b)
     return h
 
 def make_cb(bid):
@@ -361,7 +373,7 @@ def main():
             app.add_handler(CommandHandler('bots', hub_bots))
             app.add_handler(CallbackQueryHandler(hub_cb))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-            logger.info("🛠️ HUB PauloForge v5.2 online!")
+            logger.info("🛠️ HUB PauloForge v5.3 online!")
             app.run_polling()
         except Exception as e:
             logger.error(f"💥 Hub caiu ({e}) — reiniciando em 5s...")
