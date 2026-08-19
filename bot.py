@@ -1,5 +1,6 @@
 import os, re, logging, secrets, asyncio, time, json, threading, requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -17,6 +18,7 @@ WA = 'https://wa.me/5567993030021'
 logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 H = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
+LAST_PIX = {}
 
 def sb_select(table, **f):
     params = {}
@@ -52,6 +54,10 @@ def notify_admin(txt):
         try: tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': ADMIN_ID, 'text': txt})
         except Exception as e: logger.warning(f'notify_admin: {e}')
 
+def mp_token_for(b):
+    s = b.get('settings') or {}
+    return s.get('mp_token') or MP_TOKEN
+
 def kb_assinar(b):
     rows = []
     if MP_TOKEN:
@@ -59,50 +65,57 @@ def kb_assinar(b):
     rows.append([InlineKeyboardButton(f"💳 Assinar por R$ {b['preco']}/mês", url=f"{WA}?text=Quero%20assinar%20{b['nome_exibicao']}")])
     return InlineKeyboardMarkup(rows)
 
-def mp_pix(valor, descricao, email):
+def mp_pix(valor, descricao, email, token, bot_id=None):
     body = {"transaction_amount": float(valor), "description": descricao,
             "payment_method_id": "pix", "payer": {"email": email}}
     if WEBHOOK_URL.startswith('https://'):
-        body["notification_url"] = WEBHOOK_URL
+        body["notification_url"] = WEBHOOK_URL + (f"?bot={bot_id}" if bot_id else "")
     r = requests.post("https://api.mercadopago.com/v1/payments",
-        headers={"Authorization": f"Bearer {MP_TOKEN}", "X-Idempotency-Key": secrets.token_hex(16)},
+        headers={"Authorization": f"Bearer {token}", "X-Idempotency-Key": secrets.token_hex(16)},
         json=body).json()
     cop = (r.get('point_of_interaction') or {}).get('transaction_data', {}).get('qr_code')
     return cop, r
 
 # ---------- WEBHOOK MERCADO PAGO + API ----------
-def processa_pagamento(pid):
+def processa_pagamento(pid, bot_hint=None):
     try:
-        r = requests.get(f"https://api.mercadopago.com/v1/payments/{pid}", headers={"Authorization": f"Bearer {MP_TOKEN}"}).json()
-        if r.get('status') != 'approved': return
         pay = first(sb_select('payments', mp_id=pid))
-        if not pay or pay.get('status') == 'approved': return
-        sb_update('payments', pay['id'], {'status': 'approved'})
+        bid = bot_hint or (pay['bot_id'] if pay else None)
+        b = bot_row(bid) if bid else None
+        r = requests.get(f"https://api.mercadopago.com/v1/payments/{pid}",
+            headers={"Authorization": f"Bearer {MP_TOKEN}"}).json()
+        if r.get('status') != 'approved': return
         desc = r.get('description') or ''
         if desc.startswith('PLANO_'):
-            try: bid = int(desc.split('#')[1].split()[0])
-            except Exception: bid = pay['bot_id']
+            try: bidp = int(desc.split('#')[1].split()[0])
+            except Exception: bidp = pay['bot_id'] if pay else bid
             dias = 30 if 'mensal' in desc else 365
-            sb_update('bots', bid, {'paid': True, 'ativo': True, 'expira_em': (datetime.now() + timedelta(days=dias)).isoformat()})
-            b = bot_row(bid)
-            if b and b.get('creator_id'):
-                cr = first(sb_select('creators', id=b['creator_id']))
+            sb_update('bots', bidp, {'paid': True, 'ativo': True, 'expira_em': (datetime.now() + timedelta(days=dias)).isoformat()})
+            bp = bot_row(bidp)
+            if bp and bp.get('creator_id'):
+                cr = first(sb_select('creators', id=bp['creator_id']))
                 if cr and cr.get('telegram_id'):
-                    tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': cr['telegram_id'], 'text': f"✅ Pagamento confirmado! Bot {b['nome_exibicao']} ativado por {dias} dias. 🎉"})
-            notify_admin(f"✅ PIX confirmado: {desc} — R$ {pay['valor']} (ID {pay['telegram_id']})")
+                    tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': cr['telegram_id'], 'text': f"✅ Pagamento confirmado! Bot {bp['nome_exibicao']} ativado por {dias} dias. 🎉"})
+            notify_admin(f"✅ PIX confirmado: {desc} — R$ {pay['valor'] if pay else '?'}")
             return
+        if not pay or pay.get('status') == 'approved': return
+        token = mp_token_for(b) if b else MP_TOKEN
+        r2 = requests.get(f"https://api.mercadopago.com/v1/payments/{pid}",
+            headers={"Authorization": f"Bearer {token}"}).json()
+        if r2.get('status') != 'approved' and token != MP_TOKEN: return
+        sb_update('payments', pay['id'], {'status': 'approved'})
         exp = (datetime.now() + timedelta(days=30)).isoformat()
         ex = first(sb_select('subscribers', bot_id=pay['bot_id'], telegram_id=pay['telegram_id']))
         if ex: sb_update('subscribers', ex['id'], {'status': 'active', 'data_expiracao': exp})
         else: sb_insert('subscribers', {'bot_id': pay['bot_id'], 'telegram_id': pay['telegram_id'], 'status': 'active', 'data_expiracao': exp})
         tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': pay['telegram_id'], 'text': '✅ Pagamento confirmado! Acesso VIP liberado por 30 dias. 😈'})
-        b = bot_row(pay['bot_id'])
         if b and b.get('creator_id'):
             cs = first(sb_select('creators', id=b['creator_id']))
             if cs:
-                sb_insert('credits', {'creator_id': cs['id'], 'valor': round(float(pay['valor']) * 0.95, 2), 'motivo': f'assinatura bot #{b["id"]}'})
+                if not (b.get('settings') or {}).get('mp_token'):
+                    sb_insert('credits', {'creator_id': cs['id'], 'valor': round(float(pay['valor']) * 0.95, 2), 'motivo': f'assinatura bot #{b["id"]}'})
                 if cs.get('telegram_id'):
-                    tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': cs['telegram_id'], 'text': f"💰 +1 assinante no bot {b['nome_exibicao']}! Valor já no seu saldo do painel."})
+                    tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': cs['telegram_id'], 'text': f"💰 +1 assinante no bot {b['nome_exibicao']}!"})
         notify_admin(f"✅ PIX confirmado: assinatura R$ {pay['valor']} no bot #{pay['bot_id']}")
         logger.info(f"💸 pagamento {pid} aprovado e liberado")
     except Exception as e:
@@ -136,10 +149,10 @@ def api_criarbot(d):
             tokp = secrets.token_urlsafe(12)
             sb_insert('access_tokens', {'creator_id': cid, 'token': tokp})
             notify_admin(f"🎁 TESTE 12h ativado: @{uname} (ID {tid}) bot #{brow['id']}")
-            return {'code': code, 'token_painel': tokp, 'msg': f'🎁 Teste 12h ativado!\nCódigo de confirmação: {code}\nToken do painel: {tokp}'}
+            return {'code': code, 'token_painel': tokp, 'msg': f'🎁 Teste 12h ativado!\nCódigo: {code}\nToken do painel: {tokp}'}
         valor = 30.0 if plano == 'mensal' else 150.0
         brow = first(sb_insert('bots', {'bot_token': tok, 'bot_username': uname, 'nome_exibicao': nome or uname, 'chave_pix': pix, 'creator_id': cid, 'ativo': False, 'paid': False}))
-        cop, mp = mp_pix(valor, f'PLANO_{plano} bot #{brow["id"]}', f'user_{tid}@pauloforge.app')
+        cop, mp = mp_pix(valor, f'PLANO_{plano} bot #{brow["id"]}', f'user_{tid}@pauloforge.app', MP_TOKEN, brow['id'])
         if not cop:
             notify_admin(f"❌ MP falhou (plano {plano}): {str(mp)[:300]}")
             return {'msg': '❌ Falha ao gerar o Pix. Tente novamente.'}
@@ -166,12 +179,13 @@ class WH(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.end_headers()
     def do_POST(self):
-        if self.path.startswith('/api/criarbot'):
+        u = urlparse(self.path)
+        if u.path == '/api/criarbot':
             ln = int(self.headers.get('Content-Length') or 0)
             try: data = json.loads(self.rfile.read(ln)) if ln else {}
             except Exception: data = {}
             return self._json(api_criarbot(data))
-        if self.path.startswith('/mp-webhook'):
+        if u.path == '/mp-webhook':
             ln = int(self.headers.get('Content-Length') or 0)
             raw = self.rfile.read(ln) if ln else b'{}'
             try: data = json.loads(raw)
@@ -179,8 +193,9 @@ class WH(BaseHTTPRequestHandler):
             pid = None
             if isinstance(data, dict):
                 pid = (data.get('data') or {}).get('id') or data.get('id')
+            bh = (parse_qs(u.query).get('bot') or [None])[0]
             if pid:
-                threading.Thread(target=processa_pagamento, args=(str(pid),), daemon=True).start()
+                threading.Thread(target=processa_pagamento, args=(str(pid), bh), daemon=True).start()
             return self._ok()
         self._ok()
     def do_GET(self):
@@ -232,8 +247,17 @@ def make_cb(bid):
         if q.data == 'assinar_mp':
             if not MP_TOKEN:
                 return await q.message.reply_text("Pagamento online chegando. Use o botão do WhatsApp por enquanto.")
+            agora = time.time()
+            resta = 120 - (agora - LAST_PIX.get((bid, uid), 0))
+            if resta > 0:
+                return await q.message.reply_text(f"⏳ Calma! Aguarde {int(resta)}s pra gerar outro Pix.")
+            pends = [p for p in sb_select('payments', bot_id=bid, telegram_id=uid)
+                     if p.get('status') != 'approved' and (p.get('created_at') or '') > (datetime.now() - timedelta(minutes=30)).isoformat()]
+            if len(pends) >= 3:
+                return await q.message.reply_text("⚠️ Você já tem 3 Pix aguardando. Pague um deles ou use o botão do WhatsApp.")
+            LAST_PIX[(bid, uid)] = agora
             wait = await q.message.reply_text("⏳ Gerando seu Pix...")
-            cop, r = mp_pix(b['preco'], f"Assinatura {b['nome_exibicao']} 30 dias", f"user_{uid}@pauloforge.app")
+            cop, r = mp_pix(b['preco'], f"Assinatura {b['nome_exibicao']} 30 dias", f"user_{uid}@pauloforge.app", mp_token_for(b), bid)
             if not cop:
                 notify_admin(f"❌ MP falhou (assinatura bot #{bid}): {str(r)[:300]}")
                 return await wait.edit_text("❌ Falha ao gerar o Pix. Tente novamente.")
@@ -293,7 +317,7 @@ def make_vincular(bid):
 wizard = {}
 async def iniciar_wizard(update, ctx, uid):
     wizard[uid] = {'step': 'token', 'dados': {}, 'msgs': []}
-    m = await update.message.reply_text("🤖 VAMOS CRIAR SEU BOT!\n\nPasso 1/4 — Abra o @BotFather, crie um bot e cole aqui o TOKEN dele:", parse_mode='Markdown')
+    m = await update.message.reply_text("🤖 VAMOS CRIAR SEU BOT!\n\nPasso 1/4 — Abra o @BotFather, crie um bot e cole aqui o TOKEN dele: (digite cancelar pra sair)", parse_mode='Markdown')
     wizard[uid]['msgs'].append(m.message_id)
 
 async def finalizar(update, ctx, uid):
@@ -331,6 +355,9 @@ async def finalizar(update, ctx, uid):
 
 async def wizard_text(update, ctx, uid):
     w = wizard[uid]; txt = update.message.text.strip()
+    if txt.lower() in ('cancelar', 'sair'):
+        wizard.pop(uid)
+        return await update.message.reply_text("❌ Wizard cancelado.")
     if w['step'] == 'token':
         if not re.match(r'^\d+:[A-Za-z0-9_-]{20,}$', txt):
             return await update.message.reply_text("❌ Token inválido.")
@@ -383,6 +410,7 @@ async def ativ_text(update, ctx, uid):
 
 async def hub_renovar(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
+    wizard.pop(update.effective_user.id, None); ativ.pop(update.effective_user.id, None)
     p = update.message.text.split()
     bid = int(p[1]); dias = int(p[2]) if len(p) > 2 else 30
     b = bot_row(bid)
@@ -398,6 +426,7 @@ async def hub_renovar(update, ctx):
 
 async def hub_liberagrupo(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
+    wizard.pop(update.effective_user.id, None)
     p = update.message.text.split()
     bid, uid = int(p[1]), int(p[2])
     b = bot_row(bid)
@@ -428,10 +457,12 @@ async def hub_criarbot(update, ctx):
 
 async def hub_ativar(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
+    wizard.pop(update.effective_user.id, None)
     await iniciar_ativar(update, ctx, update.effective_user.id)
 
 async def hub_gerartoken(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
+    wizard.pop(update.effective_user.id, None)
     email = update.message.text.split(maxsplit=1)[1].strip().lower()
     c = first(sb_select('creators', email=email))
     cid = c['id'] if c else first(sb_insert('creators', {'email': email, 'link_code': str(secrets.randbelow(9000) + 1000)}))['id']
@@ -441,6 +472,7 @@ async def hub_gerartoken(update, ctx):
 
 async def hub_bots(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
+    wizard.pop(update.effective_user.id, None)
     bots = sb_select('bots')
     await update.message.reply_text("\n".join(f"#{b['id']} {b['nome_exibicao']} ativo={b.get('ativo')} paid={b.get('paid')}" for b in bots) or "Sem bots.")
 
@@ -572,7 +604,7 @@ def main():
             app.add_handler(CallbackQueryHandler(hub_cb))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
             app.add_error_handler(error_handler)
-            logger.info("🛠️ HUB PauloForge v8.1 online!")
+            logger.info("🛠️ HUB PauloForge v8.2 online!")
             app.run_polling()
         except Exception as e:
             logger.error(f"💥 Hub caiu ({e}) — reiniciando em 5s...")
