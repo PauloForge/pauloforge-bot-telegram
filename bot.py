@@ -59,11 +59,9 @@ def mp_token_for(b):
     return s.get('mp_token') or MP_TOKEN
 
 def kb_assinar(b):
-    rows = []
     if MP_TOKEN:
-        rows.append([InlineKeyboardButton("💳 Pix copia-e-cola (libera na hora)", callback_data='assinar_mp')])
-    rows.append([InlineKeyboardButton(f"💳 Assinar por R$ {b['preco']}/mês", url=f"{WA}?text=Quero%20assinar%20{b['nome_exibicao']}")])
-    return InlineKeyboardMarkup(rows)
+        return InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pix copia-e-cola (libera na hora)", callback_data='assinar_mp')]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"💳 Assinar por R$ {b['preco']}/mês", url=f"{WA}?text=Quero%20assinar%20{b['nome_exibicao']}")]])
 
 def mp_pix(valor, descricao, email, token, bot_id=None):
     body = {"transaction_amount": float(valor), "description": descricao,
@@ -77,6 +75,28 @@ def mp_pix(valor, descricao, email, token, bot_id=None):
     return cop, r
 
 # ---------- WEBHOOK MERCADO PAGO + API ----------
+def entrega_acesso(bp, cr):
+    tk = first(sb_select('access_tokens', creator_id=cr['id']))
+    if not tk:
+        tk = first(sb_insert('access_tokens', {'creator_id': cr['id'], 'token': secrets.token_urlsafe(12)}))
+    if cr.get('telegram_id'):
+        tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': cr['telegram_id'], 'text':
+            f"🎉 Pagamento confirmado! Bot {bp['nome_exibicao']} ATIVO.\n\n🔑 Token secreto do painel: {tk['token']}\n🆔 Seu ID: {cr['telegram_id']}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n\nUse ID + token no login. Guarde esse token!"})
+
+def bonus_madrinha(st):
+    mad = (st or {}).get('voucher_from')
+    if not mad: return
+    mb = first(sb_select('bots', creator_id=mad, ativo=True))
+    if not mb: return
+    base = datetime.now()
+    if mb.get('expira_em'):
+        try: base = max(base, datetime.fromisoformat(mb['expira_em']))
+        except Exception: pass
+    sb_update('bots', mb['id'], {'expira_em': (base + timedelta(hours=12)).isoformat()})
+    crm = first(sb_select('creators', id=mad))
+    if crm and crm.get('telegram_id'):
+        tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': crm['telegram_id'], 'text': '🎁 Sua afilhada ativou um plano! Você ganhou +12h de bônus no seu bot. 👑'})
+
 def processa_pagamento(pid, bot_hint=None):
     try:
         pay = first(sb_select('payments', mp_id=pid))
@@ -89,13 +109,15 @@ def processa_pagamento(pid, bot_hint=None):
         if desc.startswith('PLANO_'):
             try: bidp = int(desc.split('#')[1].split()[0])
             except Exception: bidp = pay['bot_id'] if pay else bid
-            dias = 30 if 'mensal' in desc else 365
-            sb_update('bots', bidp, {'paid': True, 'ativo': True, 'expira_em': (datetime.now() + timedelta(days=dias)).isoformat()})
+            pl = 'unico' if 'unico' in desc else ('pro' if 'pro' in desc else 'mensal')
+            dias = 365 if pl == 'unico' else 30
+            b0 = bot_row(bidp); st = (b0.get('settings') if b0 else None) or {}; st['plan'] = pl
+            sb_update('bots', bidp, {'paid': True, 'ativo': True, 'settings': st, 'expira_em': (datetime.now() + timedelta(days=dias)).isoformat()})
+            bonus_madrinha(st)
             bp = bot_row(bidp)
             if bp and bp.get('creator_id'):
                 cr = first(sb_select('creators', id=bp['creator_id']))
-                if cr and cr.get('telegram_id'):
-                    tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': cr['telegram_id'], 'text': f"✅ Pagamento confirmado! Bot {bp['nome_exibicao']} ativado por {dias} dias. 🎉"})
+                if cr: entrega_acesso(bp, cr)
             notify_admin(f"✅ PIX confirmado: {desc} — R$ {pay['valor'] if pay else '?'}")
             return
         if not pay or pay.get('status') == 'approved': return
@@ -127,6 +149,7 @@ def api_criarbot(d):
         tok = str(d.get('tok', '')).strip()
         nome = (d.get('nome') or '').strip()
         pix = (d.get('pix') or '').strip()
+        voucher = str(d.get('voucher', '')).strip()
         plano = d.get('plano', 'teste')
         if not tid.isdigit(): return {'msg': '❌ ID do Telegram inválido.'}
         tid = int(tid)
@@ -141,24 +164,34 @@ def api_criarbot(d):
         cid = cs['id']
         if not cs.get('ref_code'): sb_update('creators', cid, {'ref_code': 'PF' + str(cid)})
         if plano == 'teste':
-            if sb_select('login_codes', creator_id=cid, tipo='teste'):
-                return {'msg': '⚠️ Você já usou o teste grátis.\nPra liberar, escolha R$ 30/mês ou R$ 150 único.'}
+            madrinha = None
+            if voucher:
+                v = first(sb_select('login_codes', code=voucher, tipo='voucher', usado=False))
+                if not v: return {'msg': '❌ Código presente inválido ou já usado.'}
+                madrinha = v['creator_id']
+                sb_update('login_codes', v['id'], {'usado': True})
+            elif sb_select('login_codes', creator_id=cid, tipo='teste'):
+                return {'msg': '⚠️ Você já usou o teste grátis.\nUse um código presente de uma amiga ou escolha START R$30/mês, PRO R$50/mês ou ÚNICO R$150.'}
             code = str(secrets.randbelow(900000) + 100000)
-            brow = first(sb_insert('bots', {'bot_token': tok, 'bot_username': uname, 'nome_exibicao': nome or uname, 'chave_pix': pix, 'creator_id': cid, 'ativo': True, 'paid': False, 'expira_em': (datetime.now() + timedelta(hours=12)).isoformat()}))
+            st = {'plan': 'teste'}
+            if madrinha: st['voucher_from'] = madrinha
+            brow = first(sb_insert('bots', {'bot_token': tok, 'bot_username': uname, 'nome_exibicao': nome or uname, 'chave_pix': pix, 'creator_id': cid, 'ativo': True, 'paid': False, 'settings': st, 'expira_em': (datetime.now() + timedelta(hours=12)).isoformat()}))
             sb_insert('login_codes', {'creator_id': cid, 'code': code, 'tipo': 'teste'})
             tokp = secrets.token_urlsafe(12)
             sb_insert('access_tokens', {'creator_id': cid, 'token': tokp})
-            notify_admin(f"🎁 TESTE 12h ativado: @{uname} (ID {tid}) bot #{brow['id']}")
+            notify_admin(f"🎁 TESTE 12h ativado: @{uname} (ID {tid}) bot #{brow['id']}" + (f" — subsidiário de #{madrinha}" if madrinha else ""))
             return {'code': code, 'token_painel': tokp, 'msg': f'🎁 Teste 12h ativado!\nCódigo: {code}\nToken do painel: {tokp}'}
-        valor = 30.0 if plano == 'mensal' else 150.0
-        brow = first(sb_insert('bots', {'bot_token': tok, 'bot_username': uname, 'nome_exibicao': nome or uname, 'chave_pix': pix, 'creator_id': cid, 'ativo': False, 'paid': False}))
+        tabela = {'mensal': (30.0, 30), 'pro': (50.0, 30), 'unico': (150.0, 365)}
+        if plano not in tabela: return {'msg': '❌ Plano inválido.'}
+        valor, dias = tabela[plano]
+        brow = first(sb_insert('bots', {'bot_token': tok, 'bot_username': uname, 'nome_exibicao': nome or uname, 'chave_pix': pix, 'creator_id': cid, 'ativo': False, 'paid': False, 'settings': {'plan': plano}}))
         cop, mp = mp_pix(valor, f'PLANO_{plano} bot #{brow["id"]}', f'user_{tid}@pauloforge.app', MP_TOKEN, brow['id'])
         if not cop:
             notify_admin(f"❌ MP falhou (plano {plano}): {str(mp)[:300]}")
             return {'msg': '❌ Falha ao gerar o Pix. Tente novamente.'}
         sb_insert('payments', {'mp_id': str(mp.get('id')), 'bot_id': brow['id'], 'telegram_id': tid, 'valor': valor})
         notify_admin(f"💠 QR Code gerado: PLANO {plano} R$ {valor} (ID {tid} @{uname})")
-        return {'pix': cop, 'msg': '💰 Pague o Pix — seu bot ativa SOZINHO em até 1 min.'}
+        return {'pix': cop, 'msg': '💰 Pague o Pix — seu bot ativa SOZINHO e o token secreto chega no seu Telegram em até 1 min.'}
     except Exception as e:
         logger.exception('api_criarbot')
         return {'msg': f'❌ Erro interno: {e}'}
@@ -221,13 +254,7 @@ def make_start(bid):
         if not first(sb_select('leads', bot_id=bid, telegram_id=uid)):
             sb_insert('leads', {'bot_id': bid, 'telegram_id': uid})
         kb = kb_assinar(b)
-        if s.get('catalogo_on'):
-            cats = sb_select('medias', bot_id=bid, tipo='catalogo')
-            if cats:
-                t = cats[secrets.randbelow(len(cats))]
-                try: await ctx.bot.send_video(uid, t['file_id'], caption="Dá uma olhada no que te espera 👀", reply_markup=kb)
-                except Exception: pass
-        legenda = f"🔞 {b['nome_exibicao']}\n\nAssinatura: R$ {b['preco']}/mês\nPix: `{b['chave_pix']}`\n\nAssine e receba TUDO na hora 😈"
+        legenda = f"🔞 {b['nome_exibicao']}\n\nAssinatura: R$ {b['preco']}/mês\nAssine e receba TUDO na hora 😈"
         if b.get('welcome_video'):
             try:
                 await ctx.bot.send_video(uid, b['welcome_video'], caption=legenda, parse_mode='Markdown', reply_markup=kb)
@@ -236,7 +263,7 @@ def make_start(bid):
         else:
             await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=kb)
         if s.get('grupo_on') and s.get('grupo_link'):
-            gtxt = (s.get('grupo_msg') or 'Entre pro meu grupo VIP 😈') + f"\n\nTaxa de entrada: R$ {s.get('grupo_taxa') or b['preco']}\nPix: {b['chave_pix']}\n\nApós pagar, o acesso ao grupo é liberado."
+            gtxt = (s.get('grupo_msg') or 'Entre pro meu grupo VIP 😈') + f"\n\nTaxa de entrada: R$ {s.get('grupo_taxa') or b['preco']}\n\nApós pagar, o acesso ao grupo é liberado."
             await update.message.reply_text(gtxt)
     return h
 
@@ -313,104 +340,14 @@ def make_vincular(bid):
         await update.message.reply_text("🔗 Telegram vinculado ao painel!")
     return h
 
-# ---------- WIZARD CRIAR BOT (admin) ----------
-wizard = {}
-async def iniciar_wizard(update, ctx, uid):
-    wizard[uid] = {'step': 'token', 'dados': {}, 'msgs': []}
-    m = await update.message.reply_text("🤖 VAMOS CRIAR SEU BOT!\n\nPasso 1/4 — Abra o @BotFather, crie um bot e cole aqui o TOKEN dele: (digite cancelar pra sair)", parse_mode='Markdown')
-    wizard[uid]['msgs'].append(m.message_id)
-
-async def finalizar(update, ctx, uid):
-    w = wizard.pop(uid); d = w['dados']
-    wait = await update.message.reply_text("⏳ Aguarde, seu acesso está sendo gerado...")
-    try:
-        email = d['email'].lower().strip()
-        c = first(sb_select('creators', email=email))
-        if c:
-            cid = c['id']; sb_update('creators', cid, {'telegram_id': uid, 'nome': d['nome']})
-        else:
-            cid = first(sb_insert('creators', {'email': email, 'telegram_id': uid, 'nome': d['nome'], 'link_code': str(secrets.randbelow(9000) + 1000)}))['id']
-        c2 = first(sb_select('creators', id=cid))
-        if c2 and not c2.get('ref_code'): sb_update('creators', cid, {'ref_code': 'PF' + str(cid)})
-        brow = first(sb_select('bots', bot_token=d['token']))
-        if brow:
-            sb_update('bots', brow['id'], {'creator_id': cid, 'nome_exibicao': d['nome'], 'chave_pix': d['pix'], 'ativo': True, 'expira_em': (datetime.now() + timedelta(hours=12)).isoformat()})
-        else:
-            brow = first(sb_insert('bots', {'bot_token': d['token'], 'bot_username': d['username'], 'nome_exibicao': d['nome'], 'chave_pix': d['pix'], 'creator_id': cid, 'ativo': True, 'expira_em': (datetime.now() + timedelta(hours=12)).isoformat()}))
-        sb_insert('login_codes', {'creator_id': cid, 'code': str(secrets.randbelow(900000) + 100000), 'tipo': 'teste'})
-        tok = secrets.token_urlsafe(12)
-        sb_insert('access_tokens', {'creator_id': cid, 'token': tok})
-        notify_admin(f"🆕 Bot criado via wizard: @{d['username']} (ID {uid})")
-        for mid in w['msgs']:
-            try: await ctx.bot.delete_message(uid, mid)
-            except Exception: pass
-        try: await wait.delete()
-        except Exception: pass
-        await ctx.bot.send_message(uid,
-            f"🎉 PRONTO, {d['nome']}!\n\n🤖 Seu bot: @{d['username']} (id {brow['id']})\n🔑 Token do painel: {tok}\n📧 Email: {email}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n🎁 Teste grátis: 12h.\n\n📖 O worker liga seu bot em até 20s!")
-    except Exception as e:
-        logger.exception(e)
-        try: await update.message.reply_text(f"❌ Erro ao gerar acesso: {e}")
-        except Exception: pass
-
-async def wizard_text(update, ctx, uid):
-    w = wizard[uid]; txt = update.message.text.strip()
-    if txt.lower() in ('cancelar', 'sair'):
-        wizard.pop(uid)
-        return await update.message.reply_text("❌ Wizard cancelado.")
-    if w['step'] == 'token':
-        if not re.match(r'^\d+:[A-Za-z0-9_-]{20,}$', txt):
-            return await update.message.reply_text("❌ Token inválido.")
-        r = requests.get(f"https://api.telegram.org/bot{txt}/getMe").json()
-        if not r.get('ok'):
-            return await update.message.reply_text("❌ O Telegram recusou esse token.")
-        w['dados']['token'] = txt; w['dados']['username'] = r['result']['username']
-        w['step'] = 'email'
-        await update.message.reply_text("✅ Token válido!\n\nPasso 2/4 — Seu melhor e-mail:", parse_mode='Markdown')
-    elif w['step'] == 'email':
-        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', txt):
-            return await update.message.reply_text("❌ E-mail inválido.")
-        w['dados']['email'] = txt; w['step'] = 'nome'
-        await update.message.reply_text("Passo 3/4 — Nome de exibição:", parse_mode='Markdown')
-    elif w['step'] == 'nome':
-        w['dados']['nome'] = txt; w['step'] = 'pix'
-        await update.message.reply_text("Passo 4/4 — Sua chave Pix:", parse_mode='Markdown')
-    elif w['step'] == 'pix':
-        w['dados']['pix'] = txt
-        await finalizar(update, ctx, uid)
-
-# ---------- WIZARD ATIVAR + ADMIN ----------
-ativ = {}
-async def iniciar_ativar(update, ctx, uid):
-    bots = sb_select('bots', ativo=True)
-    if not bots:
-        return await update.message.reply_text("❌ Nenhum bot cadastrado.")
-    ativ[uid] = {'step': 'user', 'bots': {str(b['id']): b['id'] for b in bots}}
-    await update.message.reply_text("🎯 ATIVAR ASSINANTE\n\n" + "\n".join(f"#{b['id']} — {b['nome_exibicao']}" for b in bots) + "\n\nDigite o NÚMERO do bot:", parse_mode='Markdown')
-
-async def ativ_text(update, ctx, uid):
-    a = ativ[uid]; txt = update.message.text.strip()
-    if a['step'] == 'user':
-        bid = a['bots'].get(txt.replace('#', ''))
-        if not bid: return await update.message.reply_text("❌ Bot inválido.")
-        a['bid'] = bid; a['step'] = 'dias'
-        await update.message.reply_text("ID do cliente:")
-    elif a['step'] == 'dias':
-        if not txt.isdigit(): return await update.message.reply_text("❌ Só números.")
-        a['uidc'] = int(txt); a['step'] = 'confirma'
-        await update.message.reply_text("Por quantos dias?")
-    elif a['step'] == 'confirma':
-        dias = int(txt) if txt.isdigit() else 30
-        exp = (datetime.now() + timedelta(days=dias)).isoformat()
-        ex = first(sb_select('subscribers', bot_id=a['bid'], telegram_id=a['uidc']))
-        if ex: sb_update('subscribers', ex['id'], {'status': 'active', 'data_expiracao': exp})
-        else: sb_insert('subscribers', {'bot_id': a['bid'], 'telegram_id': a['uidc'], 'status': 'active', 'data_expiracao': exp})
-        ativ.pop(uid)
-        await update.message.reply_text(f"✅ Assinante ativado por {dias} dias!")
+# ---------- HUB (público + admin silencioso) ----------
+async def hub_start(update, ctx):
+    btn = InlineKeyboardButton("🤖 Criar meu bot", url=CRIAR_URL) if CRIAR_URL else InlineKeyboardButton("🤖 Criar meu bot", url=WA)
+    await update.message.reply_text("⚒️ PauloForge Soluções\nTenha seu próprio bot no Telegram.\n\n🎁 Teste grátis 12h · START R$ 30/mês · PRO R$ 50/mês · ÚNICO R$ 150\n\nToque pra criar o seu em 1 minuto 👇",
+        reply_markup=InlineKeyboardMarkup([[btn]]))
 
 async def hub_renovar(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    wizard.pop(update.effective_user.id, None); ativ.pop(update.effective_user.id, None)
     p = update.message.text.split()
     bid = int(p[1]); dias = int(p[2]) if len(p) > 2 else 30
     b = bot_row(bid)
@@ -426,7 +363,6 @@ async def hub_renovar(update, ctx):
 
 async def hub_liberagrupo(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    wizard.pop(update.effective_user.id, None)
     p = update.message.text.split()
     bid, uid = int(p[1]), int(p[2])
     b = bot_row(bid)
@@ -437,44 +373,42 @@ async def hub_liberagrupo(update, ctx):
     tg_api(b['bot_token'], 'sendMessage', {'chat_id': uid, 'text': f"🔓 Acesso liberado! Link do grupo VIP:\n{link}"})
     await update.message.reply_text(f"✅ Link do grupo enviado pro cliente {uid}.")
 
-async def hub_start(update, ctx):
-    uid = update.effective_user.id
-    if uid == ADMIN_ID:
-        return await update.message.reply_text("🛠️ HUB ADMIN\n\n/criarbot — wizard novo bot\n/ativar — wizard assinante\n/renovar bot_id dias\n/liberagrupo bot_id user_id\n/gerartoken email\n/bots")
-    if CRIAR_URL:
-        return await update.message.reply_text("⚒️ PauloForge Soluções\nTenha seu próprio bot no Telegram.\n\n🎁 Teste grátis 12h · R$ 30/mês · R$ 150 único\n\nToque pra criar o seu em 1 minuto 👇",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Criar meu bot", url=CRIAR_URL)]]))
-    await update.message.reply_text("⚒️ PauloForge Soluções\nTenha seu próprio bot no Telegram.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Criar meu bot", callback_data='criarbot')]]))
-
-async def hub_cb(update, ctx):
-    q = update.callback_query; await q.answer()
-    if q.data == 'criarbot':
-        await iniciar_wizard(q.message, ctx, q.from_user.id)
-
-async def hub_criarbot(update, ctx):
-    await iniciar_wizard(update, ctx, update.effective_user.id)
-
-async def hub_ativar(update, ctx):
-    if update.effective_user.id != ADMIN_ID: return
-    wizard.pop(update.effective_user.id, None)
-    await iniciar_ativar(update, ctx, update.effective_user.id)
-
 async def hub_gerartoken(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    wizard.pop(update.effective_user.id, None)
-    email = update.message.text.split(maxsplit=1)[1].strip().lower()
-    c = first(sb_select('creators', email=email))
-    cid = c['id'] if c else first(sb_insert('creators', {'email': email, 'link_code': str(secrets.randbelow(9000) + 1000)}))['id']
-    tok = secrets.token_urlsafe(16)
-    sb_insert('access_tokens', {'creator_id': cid, 'token': tok})
-    await update.message.reply_text(f"🔑 Token do painel pra {email}:\n{tok}")
+    tid = update.message.text.split(maxsplit=1)[1].strip()
+    c = first(sb_select('creators', telegram_id=int(tid)))
+    if not c: return await update.message.reply_text("❌ Criadora não encontrada por esse ID.")
+    tok = secrets.token_urlsafe(12)
+    sb_insert('access_tokens', {'creator_id': c['id'], 'token': tok})
+    await update.message.reply_text(f"🔑 Novo token pra ID {tid}:\n{tok}")
+
+async def hub_tokens(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return
+    toks = sb_select('access_tokens')
+    lines = []
+    for t in toks:
+        cr = first(sb_select('creators', id=t['creator_id']))
+        who = (cr.get('nome') or cr.get('email') or '?') + ' · tg ' + str(cr.get('telegram_id') or '-')
+        lines.append(f"#{t['creator_id']} {who}\n🔑 {t['token']}")
+    await update.message.reply_text("\n\n".join(lines) or "Sem tokens.")
 
 async def hub_bots(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    wizard.pop(update.effective_user.id, None)
     bots = sb_select('bots')
-    await update.message.reply_text("\n".join(f"#{b['id']} {b['nome_exibicao']} ativo={b.get('ativo')} paid={b.get('paid')}" for b in bots) or "Sem bots.")
+    await update.message.reply_text("\n".join(f"#{b['id']} {b['nome_exibicao']} ativo={b.get('ativo')} paid={b.get('paid')} plan={((b.get('settings') or {}).get('plan')) or '-'}" for b in bots) or "Sem bots.")
+
+async def manda_resumo(bot):
+    bots = sb_select('bots')
+    ativos = [b for b in bots if b.get('ativo')]
+    pagos = [b for b in bots if b.get('paid')]
+    subs = sb_select('subscribers', status='active')
+    vends = [c for c in sb_select('creators') if c.get('telegram_id')]
+    await bot.send_message(ADMIN_ID,
+        f"📊 RESUMO PauloForge\n👥 vendedoras ativas: {len(vends)}\n🤖 bots ativos: {len(ativos)} (pagos: {len(pagos)})\n💎 assinantes ativos: {len(subs)}")
+
+async def hub_resumo(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return
+    await manda_resumo(ctx.bot)
 
 async def error_handler(update, ctx):
     logger.error(f"💥 ERRO DE HANDLER: {ctx.error}")
@@ -486,8 +420,17 @@ async def envia_codigos(app):
             for lc in sb_select('login_codes', enviado=False):
                 cs = first(sb_select('creators', id=lc['creator_id']))
                 if cs and cs.get('telegram_id'):
-                    prefix = "💸 Código de retirada:" if lc.get('tipo') == 'retirada' else ("🔑 Código de troca de token:" if lc.get('tipo') == 'token' else ("🎁 Código do MODO TESTE:" if lc.get('tipo') == 'teste' else "🔐 Código de acesso ao painel:"))
-                    await app.bot.send_message(cs['telegram_id'], f"{prefix} {lc['code']}")
+                    if lc.get('tipo') == 'retirada':
+                        txt = f"💸 Você solicitou uma retirada. Código de confirmação: {lc['code']}\nSe não foi você, ignore."
+                    elif lc.get('tipo') == 'token':
+                        txt = f"🔑 Você solicitou troca de token. Código: {lc['code']}\nSe não foi você, ignore."
+                    elif lc.get('tipo') == 'teste':
+                        txt = f"🎁 Código do seu MODO TESTE: {lc['code']}\nSe não foi você, ignore."
+                    elif lc.get('tipo') == 'voucher':
+                        txt = f"🎁 Código PRESENTE gerado (12h grátis pra uma amiga): {lc['code']}\nEla usa em criarbot.html no campo 'código presente'."
+                    else:
+                        txt = f"🔐 Você solicitou um código de acesso ao painel PauloForge.\nSe não foi você, ignore esta mensagem.\n\nCódigo: {lc['code']}"
+                    await app.bot.send_message(cs['telegram_id'], txt)
                 sb_update('login_codes', lc['id'], {'enviado': True})
         except Exception as e: logger.warning(e)
         await asyncio.sleep(5)
@@ -499,17 +442,20 @@ async def drip_teasers(app):
                 b = bot_row(ld['bot_id'])
                 if not b or not b.get('ativo'): continue
                 s = b.get('settings') or {}
-                if s.get('teaser_on') is False: continue
+                if not s.get('teaser_on'): continue
                 horas = int(s.get('teaser_h') or 6)
                 if ld.get('ultimo_aviso') and ld['ultimo_aviso'] > (datetime.now() - timedelta(hours=horas)).isoformat(): continue
                 if is_active_sub(ld['bot_id'], ld['telegram_id']): continue
                 teasers = sb_select('medias', bot_id=ld['bot_id'], tipo='teaser')
                 if not teasers: continue
                 t = teasers[secrets.randbelow(len(teasers))]
+                cap = (t['legenda'] or 'Olha o que você tá perdendo 👀') + "\n\nVem assinar e receber TUDO 😈"
+                kb = kb_assinar(b).to_dict()
                 try:
-                    cap = (t['legenda'] or 'Olha o que você tá perdendo 👀') + "\n\nVem assinar e receber TUDO 😈"
-                    if t['file_type'] == 'photo': await app.bot.send_photo(ld['telegram_id'], t['file_id'], caption=cap, reply_markup=kb_assinar(b))
-                    else: await app.bot.send_video(ld['telegram_id'], t['file_id'], caption=cap, reply_markup=kb_assinar(b))
+                    if t['file_type'] == 'photo':
+                        tg_api(b['bot_token'], 'sendPhoto', {'chat_id': ld['telegram_id'], 'photo': t['file_id'], 'caption': cap, 'reply_markup': json.dumps(kb)})
+                    else:
+                        tg_api(b['bot_token'], 'sendVideo', {'chat_id': ld['telegram_id'], 'video': t['file_id'], 'caption': cap, 'reply_markup': json.dumps(kb)})
                 except Exception as e: logger.warning(e)
                 sb_update('leads', ld['id'], {'ultimo_aviso': datetime.now().isoformat()})
         except Exception as e: logger.warning(e)
@@ -524,7 +470,7 @@ async def checa_expiracao(app):
                     sb_update('bots', b['id'], {'ativo': False})
                     cs = first(sb_select('creators', id=b['creator_id'])) if b.get('creator_id') else None
                     if cs and cs.get('telegram_id'):
-                        await app.bot.send_message(cs['telegram_id'], "⛔ Bot offline (plano vencido). Renove com o suporte.")
+                        await app.bot.send_message(cs['telegram_id'], "⛔ Bot offline (plano vencido). Renove pelo site ou suporte.")
         except Exception as e: logger.warning(e)
         await asyncio.sleep(60)
 
@@ -541,14 +487,7 @@ async def vigia_bots(app):
 async def resumo_periodico(app):
     await asyncio.sleep(20)
     while True:
-        try:
-            bots = sb_select('bots')
-            ativos = [b for b in bots if b.get('ativo')]
-            pagos = [b for b in bots if b.get('paid')]
-            subs = sb_select('subscribers', status='active')
-            vends = [c for c in sb_select('creators') if c.get('telegram_id')]
-            await app.bot.send_message(ADMIN_ID,
-                f"📊 RESUMO PauloForge\n👥 vendedoras ativas: {len(vends)}\n🤖 bots ativos: {len(ativos)} (pagos: {len(pagos)})\n💎 assinantes ativos: {len(subs)}")
+        try: await manda_resumo(app.bot)
         except Exception as e: logger.warning(e)
         await asyncio.sleep(6 * 3600)
 
@@ -584,27 +523,19 @@ async def post_init(application):
     asyncio.create_task(vigia_bots(application))
     asyncio.create_task(resumo_periodico(application))
 
-async def on_text(update, ctx):
-    uid = update.effective_user.id
-    if uid in wizard: return await wizard_text(update, ctx, uid)
-    if uid in ativ and uid == ADMIN_ID: return await ativ_text(update, ctx, uid)
-
 def main():
     while True:
         try:
             app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
             app.add_handler(CommandHandler('start', hub_start))
-            app.add_handler(CommandHandler('criarbot', hub_criarbot))
-            app.add_handler(CommandHandler('novabot', hub_criarbot))
-            app.add_handler(CommandHandler('ativar', hub_ativar))
             app.add_handler(CommandHandler('renovar', hub_renovar))
             app.add_handler(CommandHandler('liberagrupo', hub_liberagrupo))
             app.add_handler(CommandHandler('gerartoken', hub_gerartoken))
+            app.add_handler(CommandHandler('tokens', hub_tokens))
             app.add_handler(CommandHandler('bots', hub_bots))
-            app.add_handler(CallbackQueryHandler(hub_cb))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+            app.add_handler(CommandHandler('resumo', hub_resumo))
             app.add_error_handler(error_handler)
-            logger.info("🛠️ HUB PauloForge v8.2 online!")
+            logger.info("🛠️ HUB PauloForge v8.4 online!")
             app.run_polling()
         except Exception as e:
             logger.error(f"💥 Hub caiu ({e}) — reiniciando em 5s...")
