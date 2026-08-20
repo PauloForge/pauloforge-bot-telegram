@@ -2,7 +2,7 @@ import os, re, logging, secrets, asyncio, time, json, threading, requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -19,6 +19,7 @@ logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=loggin
 logger = logging.getLogger(__name__)
 H = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
 LAST_PIX = {}
+WEB_OK = False
 
 def sb_select(table, **f):
     params = {}
@@ -58,10 +59,15 @@ def mp_token_for(b):
     s = b.get('settings') or {}
     return s.get('mp_token') or MP_TOKEN
 
+def modo_pagamento(b):
+    s = b.get('settings') or {}
+    if s.get('mp_token'): return 'proprio'
+    return s.get('pix_mode') or 'auto'
+
 def kb_assinar(b):
-    if MP_TOKEN:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pix copia-e-cola (libera na hora)", callback_data='assinar_mp')]])
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"💳 Assinar por R$ {b['preco']}/mês", url=f"{WA}?text=Quero%20assinar%20{b['nome_exibicao']}")]])
+    if modo_pagamento(b) == 'manual':
+        return InlineKeyboardMarkup([[InlineKeyboardButton(f"💳 Assinar por R$ {b['preco']}/mês", url=f"{WA}?text=Quero%20assinar%20{b['nome_exibicao']}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pix copia-e-cola (libera na hora)", callback_data='assinar_mp')]])
 
 def mp_pix(valor, descricao, email, token, bot_id=None):
     body = {"transaction_amount": float(valor), "description": descricao,
@@ -81,7 +87,7 @@ def entrega_acesso(bp, cr):
         tk = first(sb_insert('access_tokens', {'creator_id': cr['id'], 'token': secrets.token_urlsafe(12)}))
     if cr.get('telegram_id'):
         tg_api(BOT_TOKEN, 'sendMessage', {'chat_id': cr['telegram_id'], 'text':
-            f"🎉 Pagamento confirmado! Bot {bp['nome_exibicao']} ATIVO.\n\n🔑 Token secreto do painel: {tk['token']}\n🆔 Seu ID: {cr['telegram_id']}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n\nUse ID + token no login. Guarde esse token!"})
+            f"🎉 Pagamento confirmado! Bot {bp['nome_exibicao']} ATIVO.\n\n🔑 Token secreto do painel: {tk['token']}\n🆑 Seu ID: {cr['telegram_id']}\n🌐 Painel: {PAINEL_URL or 'em breve'}\n\nUse ID + token no login. Guarde esse token!"})
 
 def bonus_madrinha(st):
     mad = (st or {}).get('voucher_from')
@@ -142,6 +148,7 @@ def processa_pagamento(pid, bot_hint=None):
         logger.info(f"💸 pagamento {pid} aprovado e liberado")
     except Exception as e:
         logger.error(f"webhook erro: {e}")
+        notify_admin(f"💥 ERRO webhook: {str(e)[:300]}")
 
 def api_criarbot(d):
     try:
@@ -194,6 +201,7 @@ def api_criarbot(d):
         return {'pix': cop, 'msg': '💰 Pague o Pix — seu bot ativa SOZINHO e o token secreto chega no seu Telegram em até 1 min.'}
     except Exception as e:
         logger.exception('api_criarbot')
+        notify_admin(f"💥 ERRO api_criarbot: {str(e)[:300]}")
         return {'msg': f'❌ Erro interno: {e}'}
 
 class WH(BaseHTTPRequestHandler):
@@ -212,94 +220,118 @@ class WH(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.end_headers()
     def do_POST(self):
-        u = urlparse(self.path)
-        if u.path == '/api/criarbot':
-            ln = int(self.headers.get('Content-Length') or 0)
-            try: data = json.loads(self.rfile.read(ln)) if ln else {}
-            except Exception: data = {}
-            return self._json(api_criarbot(data))
-        if u.path == '/mp-webhook':
-            ln = int(self.headers.get('Content-Length') or 0)
-            raw = self.rfile.read(ln) if ln else b'{}'
-            try: data = json.loads(raw)
-            except Exception: data = {}
-            pid = None
-            if isinstance(data, dict):
-                pid = (data.get('data') or {}).get('id') or data.get('id')
-            bh = (parse_qs(u.query).get('bot') or [None])[0]
-            if pid:
-                threading.Thread(target=processa_pagamento, args=(str(pid), bh), daemon=True).start()
-            return self._ok()
-        self._ok()
+        try:
+            u = urlparse(self.path)
+            if u.path == '/api/criarbot':
+                ln = int(self.headers.get('Content-Length') or 0)
+                try: data = json.loads(self.rfile.read(ln)) if ln else {}
+                except Exception: data = {}
+                return self._json(api_criarbot(data))
+            if u.path == '/mp-webhook':
+                ln = int(self.headers.get('Content-Length') or 0)
+                raw = self.rfile.read(ln) if ln else b'{}'
+                try: data = json.loads(raw)
+                except Exception: data = {}
+                pid = None
+                if isinstance(data, dict):
+                    pid = (data.get('data') or {}).get('id') or data.get('id')
+                bh = (parse_qs(u.query).get('bot') or [None])[0]
+                if pid:
+                    threading.Thread(target=processa_pagamento, args=(str(pid), bh), daemon=True).start()
+                return self._ok()
+            self._ok()
+        except Exception as e:
+            logger.error(f'HTTP erro: {e}')
+            self._ok()
     def do_GET(self):
         self._ok()
     def log_message(self, *a): pass
 
 def start_web_server():
-    port = int(os.getenv('PORT', '8080'))
-    srv = ThreadingHTTPServer(('0.0.0.0', port), WH)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    logger.info(f"🌐 Servidor webhook+API na porta {port}")
+    global WEB_OK
+    if WEB_OK: return
+    try:
+        port = int(os.getenv('PORT', '8080'))
+        srv = ThreadingHTTPServer(('0.0.0.0', port), WH)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        WEB_OK = True
+        logger.info(f"🌐 Servidor webhook+API na porta {port}")
+    except Exception as e:
+        logger.error(f"web server falhou: {e}")
 
 # ---------- BOTS DAS CRIADORAS ----------
 def make_start(bid):
     async def h(update, ctx):
-        b = bot_row(bid); uid = update.effective_user.id
-        if not b: return
-        s = b.get('settings') or {}
-        if is_active_sub(bid, uid):
-            await update.message.reply_text("🔥 VIP ativo! Aproveite 😈", parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📸 Ver conteúdo", callback_data='ver')]]))
-            return
-        if not first(sb_select('leads', bot_id=bid, telegram_id=uid)):
-            sb_insert('leads', {'bot_id': bid, 'telegram_id': uid})
-        kb = kb_assinar(b)
-        legenda = f"🔞 {b['nome_exibicao']}\n\nAssinatura: R$ {b['preco']}/mês\nAssine e receba TUDO na hora 😈"
-        if b.get('welcome_video'):
-            try:
-                await ctx.bot.send_video(uid, b['welcome_video'], caption=legenda, parse_mode='Markdown', reply_markup=kb)
-            except Exception:
-                await update.message.reply_text(legenda, parse_mode='Markdown', reply_markup=kb)
-        else:
-            await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=kb)
-        if s.get('grupo_on') and s.get('grupo_link'):
-            gtxt = (s.get('grupo_msg') or 'Entre pro meu grupo VIP 😈') + f"\n\nTaxa de entrada: R$ {s.get('grupo_taxa') or b['preco']}\n\nApós pagar, o acesso ao grupo é liberado."
-            await update.message.reply_text(gtxt)
+        try:
+            b = bot_row(bid); uid = update.effective_user.id
+            if not b: return
+            s = b.get('settings') or {}
+            if is_active_sub(bid, uid):
+                await update.message.reply_text("🔥 VIP ativo! Aproveite 😈", parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📸 Ver conteúdo", callback_data='ver')]]))
+                return
+            if not first(sb_select('leads', bot_id=bid, telegram_id=uid)):
+                sb_insert('leads', {'bot_id': bid, 'telegram_id': uid})
+            kb = kb_assinar(b)
+            m = modo_pagamento(b)
+            if m == 'manual':
+                legenda = f"🔞 {b['nome_exibicao']}\n\nAssinatura: R$ {b['preco']}/mês\nPix: `{b['chave_pix']}`\n\nPagou? A equipe libera seu acesso rapidinho 😈"
+            elif m == 'proprio':
+                legenda = f"🔞 {b['nome_exibicao']}\n\nAssinatura: R$ {b['preco']}/mês\n💳 Pagamento direto pra criadora — pagou, liberou na hora 😈"
+            else:
+                legenda = f"🔞 {b['nome_exibicao']}\n\nAssinatura: R$ {b['preco']}/mês\n💳 Pagamento gerenciado pela equipe PauloForge — pagou, liberou na hora 😈"
+            if b.get('welcome_video'):
+                try:
+                    await ctx.bot.send_video(uid, b['welcome_video'], caption=legenda, parse_mode='Markdown', reply_markup=kb)
+                except Exception:
+                    await update.message.reply_text(legenda, parse_mode='Markdown', reply_markup=kb)
+            else:
+                await update.message.reply_text(legenda + "\n\nToque no botão pra assinar 👇", parse_mode='Markdown', reply_markup=kb)
+            if s.get('grupo_on') and s.get('grupo_link'):
+                gtxt = (s.get('grupo_msg') or 'Entre pro meu grupo VIP 😈') + f"\n\nTaxa de entrada: R$ {s.get('grupo_taxa') or b['preco']}" + (f"\nPix: {b['chave_pix']}" if m == 'manual' else '') + "\n\nApós pagar, o acesso ao grupo é liberado."
+                await update.message.reply_text(gtxt)
+        except Exception as e:
+            logger.exception(f'make_start bot {bid}')
+            notify_admin(f"💥 ERRO start bot #{bid}: {str(e)[:300]}")
     return h
 
 def make_cb(bid):
     async def h(update, ctx):
-        q = update.callback_query; await q.answer(); uid = update.effective_user.id
-        b = bot_row(bid)
-        if q.data == 'assinar_mp':
-            if not MP_TOKEN:
-                return await q.message.reply_text("Pagamento online chegando. Use o botão do WhatsApp por enquanto.")
-            agora = time.time()
-            resta = 120 - (agora - LAST_PIX.get((bid, uid), 0))
-            if resta > 0:
-                return await q.message.reply_text(f"⏳ Calma! Aguarde {int(resta)}s pra gerar outro Pix.")
-            pends = [p for p in sb_select('payments', bot_id=bid, telegram_id=uid)
-                     if p.get('status') != 'approved' and (p.get('created_at') or '') > (datetime.now() - timedelta(minutes=30)).isoformat()]
-            if len(pends) >= 3:
-                return await q.message.reply_text("⚠️ Você já tem 3 Pix aguardando. Pague um deles ou use o botão do WhatsApp.")
-            LAST_PIX[(bid, uid)] = agora
-            wait = await q.message.reply_text("⏳ Gerando seu Pix...")
-            cop, r = mp_pix(b['preco'], f"Assinatura {b['nome_exibicao']} 30 dias", f"user_{uid}@pauloforge.app", mp_token_for(b), bid)
-            if not cop:
-                notify_admin(f"❌ MP falhou (assinatura bot #{bid}): {str(r)[:300]}")
-                return await wait.edit_text("❌ Falha ao gerar o Pix. Tente novamente.")
-            sb_insert('payments', {'mp_id': str(r.get('id')), 'bot_id': bid, 'telegram_id': uid, 'valor': float(b['preco'])})
-            notify_admin(f"💠 QR Code gerado: assinatura R$ {b['preco']} bot #{bid}")
-            await wait.edit_text("📲 Pix copia e cola:\n\n`" + cop + "`\n\nPagou, liberou SOZINHO em até 1 min ✅", parse_mode='Markdown')
-            return
-        if not is_active_sub(bid, uid):
-            return await q.message.reply_text("⚠️ Só assinantes. Toque abaixo 👇", reply_markup=kb_assinar(b))
-        medias = sb_select('medias', bot_id=bid, tipo='vip')
-        if not medias:
-            return await q.message.reply_text("📸 Conteúdo em breve!")
-        for m in medias:
-            if m['file_type'] == 'photo': await ctx.bot.send_photo(uid, m['file_id'], caption=m['legenda'])
-            else: await ctx.bot.send_video(uid, m['file_id'], caption=m['legenda'])
+        try:
+            q = update.callback_query; await q.answer(); uid = update.effective_user.id
+            b = bot_row(bid)
+            if q.data == 'assinar_mp':
+                if not MP_TOKEN:
+                    return await q.message.reply_text("Pagamento online chegando. Use o botão do WhatsApp por enquanto.")
+                agora = time.time()
+                resta = 120 - (agora - LAST_PIX.get((bid, uid), 0))
+                if resta > 0:
+                    return await q.message.reply_text(f"⏳ Calma! Aguarde {int(resta)}s pra gerar outro Pix.")
+                pends = [p for p in sb_select('payments', bot_id=bid, telegram_id=uid)
+                         if p.get('status') != 'approved' and (p.get('created_at') or '') > (datetime.now() - timedelta(minutes=30)).isoformat()]
+                if len(pends) >= 3:
+                    return await q.message.reply_text("⚠️ Você já tem 3 Pix aguardando. Pague um deles ou use o botão do WhatsApp.")
+                LAST_PIX[(bid, uid)] = agora
+                wait = await q.message.reply_text("⏳ Gerando seu Pix...")
+                cop, r = mp_pix(b['preco'], f"Assinatura {b['nome_exibicao']} 30 dias", f"user_{uid}@pauloforge.app", mp_token_for(b), bid)
+                if not cop:
+                    notify_admin(f"❌ MP falhou (assinatura bot #{bid}): {str(r)[:300]}")
+                    return await wait.edit_text("❌ Falha ao gerar o Pix. Tente novamente.")
+                sb_insert('payments', {'mp_id': str(r.get('id')), 'bot_id': bid, 'telegram_id': uid, 'valor': float(b['preco'])})
+                notify_admin(f"💠 QR Code gerado: assinatura R$ {b['preco']} bot #{bid}")
+                await wait.edit_text("📲 Pix copia e cola:\n\n`" + cop + "`\n\nPagou, liberou SOZINHO em até 1 min ✅", parse_mode='Markdown')
+                return
+            if not is_active_sub(bid, uid):
+                return await q.message.reply_text("⚠️ Só assinantes. Toque abaixo 👇", reply_markup=kb_assinar(b))
+            medias = sb_select('medias', bot_id=bid, tipo='vip')
+            if not medias:
+                return await q.message.reply_text("📸 Conteúdo em breve!")
+            for m in medias:
+                if m['file_type'] == 'photo': await ctx.bot.send_photo(uid, m['file_id'], caption=m['legenda'])
+                else: await ctx.bot.send_video(uid, m['file_id'], caption=m['legenda'])
+        except Exception as e:
+            logger.exception(f'make_cb bot {bid}')
+            notify_admin(f"💥 ERRO callback bot #{bid}: {str(e)[:300]}")
     return h
 
 def make_media(bid):
@@ -340,11 +372,15 @@ def make_vincular(bid):
         await update.message.reply_text("🔗 Telegram vinculado ao painel!")
     return h
 
-# ---------- HUB (público + admin silencioso) ----------
+# ---------- HUB ----------
 async def hub_start(update, ctx):
-    btn = InlineKeyboardButton("🤖 Criar meu bot", url=CRIAR_URL) if CRIAR_URL else InlineKeyboardButton("🤖 Criar meu bot", url=WA)
-    await update.message.reply_text("⚒️ PauloForge Soluções\nTenha seu próprio bot no Telegram.\n\n🎁 Teste grátis 12h · START R$ 30/mês · PRO R$ 50/mês · ÚNICO R$ 150\n\nToque pra criar o seu em 1 minuto 👇",
-        reply_markup=InlineKeyboardMarkup([[btn]]))
+    try:
+        btn = InlineKeyboardButton("🤖 Criar meu bot", url=CRIAR_URL) if CRIAR_URL else InlineKeyboardButton("🤖 Criar meu bot", url=WA)
+        await update.message.reply_text("⚒️ PauloForge Soluções\nTenha seu próprio bot no Telegram.\n\n🎁 Teste grátis 12h · START R$ 30/mês · PRO R$ 50/mês · ÚNICO R$ 150\n\nToque pra criar o seu em 1 minuto 👇",
+            reply_markup=InlineKeyboardMarkup([[btn]]))
+    except Exception as e:
+        logger.exception('hub_start')
+        notify_admin(f"💥 ERRO hub_start: {str(e)[:300]}")
 
 async def hub_renovar(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
@@ -410,8 +446,42 @@ async def hub_resumo(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     await manda_resumo(ctx.bot)
 
+# ---------- WIZARD ATIVAR (admin libera assinante manual) ----------
+ativ = {}
+async def hub_ativar(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return
+    wizard_kill = update.effective_user.id
+    bots = sb_select('bots', ativo=True)
+    if not bots:
+        return await update.message.reply_text("❌ Nenhum bot cadastrado.")
+    ativ[wizard_kill] = {'step': 'user', 'bots': {str(b['id']): b['id'] for b in bots}}
+    await update.message.reply_text("🎯 ATIVAR ASSINANTE\n\n" + "\n".join(f"#{b['id']} — {b['nome_exibicao']}" for b in bots) + "\n\nDigite o NÚMERO do bot:", parse_mode='Markdown')
+
+async def ativ_text(update, ctx, uid):
+    a = ativ[uid]; txt = update.message.text.strip()
+    if txt.lower() in ('cancelar', 'sair'):
+        ativ.pop(uid); return await update.message.reply_text("❌ Cancelado.")
+    if a['step'] == 'user':
+        bid = a['bots'].get(txt.replace('#', ''))
+        if not bid: return await update.message.reply_text("❌ Bot inválido.")
+        a['bid'] = bid; a['step'] = 'dias'
+        await update.message.reply_text("ID do cliente:")
+    elif a['step'] == 'dias':
+        if not txt.isdigit(): return await update.message.reply_text("❌ Só números.")
+        a['uidc'] = int(txt); a['step'] = 'confirma'
+        await update.message.reply_text("Por quantos dias?")
+    elif a['step'] == 'confirma':
+        dias = int(txt) if txt.isdigit() else 30
+        exp = (datetime.now() + timedelta(days=dias)).isoformat()
+        ex = first(sb_select('subscribers', bot_id=a['bid'], telegram_id=a['uidc']))
+        if ex: sb_update('subscribers', ex['id'], {'status': 'active', 'data_expiracao': exp})
+        else: sb_insert('subscribers', {'bot_id': a['bid'], 'telegram_id': a['uidc'], 'status': 'active', 'data_expiracao': exp})
+        ativ.pop(uid)
+        await update.message.reply_text(f"✅ Assinante ativado por {dias} dias!")
+
 async def error_handler(update, ctx):
     logger.error(f"💥 ERRO DE HANDLER: {ctx.error}")
+    notify_admin(f"💥 ERRO handler: {ctx.error.__class__.__name__}: {str(ctx.error)[:250]}")
 
 # ---------- TAREFAS ----------
 async def envia_codigos(app):
@@ -523,6 +593,10 @@ async def post_init(application):
     asyncio.create_task(vigia_bots(application))
     asyncio.create_task(resumo_periodico(application))
 
+async def on_text(update, ctx):
+    uid = update.effective_user.id
+    if uid in ativ and uid == ADMIN_ID: return await ativ_text(update, ctx, uid)
+
 def main():
     while True:
         try:
@@ -534,11 +608,15 @@ def main():
             app.add_handler(CommandHandler('tokens', hub_tokens))
             app.add_handler(CommandHandler('bots', hub_bots))
             app.add_handler(CommandHandler('resumo', hub_resumo))
+            app.add_handler(CommandHandler('ativar', hub_ativar))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
             app.add_error_handler(error_handler)
-            logger.info("🛠️ HUB PauloForge v8.4 online!")
+            logger.info("🛠️ HUB PauloForge v9 BLINDADO online!")
+            notify_admin("🟢 HUB ONLINE v9 BLINDADO — sistema pronto pra vender.")
             app.run_polling()
         except Exception as e:
             logger.error(f"💥 Hub caiu ({e}) — reiniciando em 5s...")
+            notify_admin(f"🔁 Hub reiniciando: {str(e)[:200]}")
             time.sleep(5)
 
 if __name__ == '__main__':
